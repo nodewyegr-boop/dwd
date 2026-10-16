@@ -19,8 +19,8 @@ DISCORD_TOKEN   = os.getenv('DISCORD_TOKEN')
 OWNER_ID        = 1488103702488154173
 PRICE_PER_TOKEN = 0.65
 PHONE_NUMBER    = '0837751528'
-DOKMAI_API_KEY  = '0da2d1ead86fa13403907f4796b0d93cbd96e51a7c87d1ffa74c4af9c396ac30'
-DOKMAI_URL      = 'https://angpao.dokmai.app/api/v1/redeem'
+PLANARIA_API_KEY = '0da2d1ead86fa13403907f4796b0d93cbd96e51a7c87d1ffa74c4af9c396ac30'
+PLANARIA_URL    = 'https://www.planariashop.com/api/truewallet.php'
 GIF_URL        = (
     'https://cdn.discordapp.com/attachments/1559527131728584766/'
     '1560446530874515526/6414b459c71ca7c53b14798235d412e5.gif'
@@ -59,15 +59,12 @@ def _save(path: str, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-# inventory  →  { "items": ["tok1", "tok2", ...], "sold": 0 }
 def load_inv():     return _load(INVENTORY_FILE, {'items': [], 'sold': 0})
 def save_inv(d):    _save(INVENTORY_FILE, d)
 
-# users  →  { "user_id": { "balance": 0.0, "username": "", "top_ups": [], "purchases": [] } }
 def load_users():   return _load(USERS_FILE, {})
 def save_users(d):  _save(USERS_FILE, d)
 
-# purchases  →  { "P0001": { "user_id", "username", "items", "qty", "cost", "timestamp" } }
 def load_purchases():   return _load(PURCHASES_FILE, {})
 def save_purchases(d):  _save(PURCHASES_FILE, d)
 
@@ -95,83 +92,57 @@ def err_embed(msg: str) -> discord.Embed:
     return discord.Embed(description=msg, color=discord.Color.red())
 
 # ─────────────────────────────────────────────
-# TRUEMONEY / VALAN.SHOP
+# TRUEMONEY — planariashop.com
 # ─────────────────────────────────────────────
 
 async def redeem_truemoney(voucher_link: str) -> float | None:
     """
-    Redeem a TrueMoney Wallet envelope via angpao.dokmai.app
-    POST JSON → { phoneNumber, voucherCode }
-    Header: X-API-Key: <key>
-    Response success: { status: { code: "SUCCESS" }, data: { voucher: { amount_baht: N } } }
+    Redeem a TrueMoney envelope via planariashop.com
+    POST form-data: keyapi, phone, gift_link
+    Response success: { "status": "success", "amount": "10.00", ... }
+    Response fail:    { "status": "error", "message": "..." }
     Returns amount (float) on success, None on failure.
     """
-    # ดึง voucher code ออกจาก URL ถ้าเป็น link เต็ม
-    # https://gift.truemoney.com/campaign/?v=XXXXXXXX → XXXXXXXX
-    import re
-    code = voucher_link.strip()
-    m = re.search(r'[?&]v=([A-Za-z0-9]+)', code)
-    if m:
-        code = m.group(1)
-
-    payload = {
-        'phoneNumber': PHONE_NUMBER,
-        'voucherCode': code,
-    }
-    headers = {
-        'Content-Type': 'application/json',
-        'X-API-Key':    DOKMAI_API_KEY,
-        'Accept':       'application/json',
-    }
+    payload = aiohttp.FormData()
+    payload.add_field('keyapi',    PLANARIA_API_KEY)
+    payload.add_field('phone',     PHONE_NUMBER)
+    payload.add_field('gift_link', voucher_link.strip())
 
     try:
         async with aiohttp.ClientSession() as session:
             timeout = aiohttp.ClientTimeout(total=30)
             async with session.post(
-                DOKMAI_URL,
-                json=payload,
-                headers=headers,
+                PLANARIA_URL,
+                data=payload,
                 timeout=timeout,
             ) as resp:
                 raw = await resp.text()
-                print(f'[dokmai] status={resp.status} body={raw[:200]}')
+                print(f'[planaria] status={resp.status} body={raw[:300]}')
 
                 try:
                     data = await resp.json(content_type=None)
                 except Exception:
+                    import json as _j
+                    try:
+                        data = _j.loads(raw)
+                    except Exception:
+                        print('[planaria] cannot parse JSON')
+                        return None
+
+                if data.get('status') != 'success':
+                    print(f'[planaria] failed: {data.get("message")}')
                     return None
 
-                # ตรวจ success
-                status = data.get('status', {})
-                code_str = status.get('code', '')
-                if code_str != 'SUCCESS':
-                    print(f'[dokmai] failed: {code_str} — {status.get("message")}')
+                amt = data.get('amount')
+                if amt is None:
                     return None
-
-                # ดึงจำนวนเงิน
-                voucher_data = data.get('data', {}).get('voucher', {})
-                for key in ('amount_baht', 'amount', 'value'):
-                    val = voucher_data.get(key)
-                    if isinstance(val, (int, float)):
-                        return float(val)
-
-                # fallback: หา amount ทุกที่ใน response
-                import json as _json
-                flat = _json.dumps(data)
-                nm = re.search(r'"amount_baht"\s*:\s*(\d+(?:\.\d+)?)', flat)
-                if nm:
-                    return float(nm.group(1))
-                nm = re.search(r'"amount"\s*:\s*(\d+(?:\.\d+)?)', flat)
-                if nm:
-                    return float(nm.group(1))
-
-                return None
+                return float(str(amt).replace(',', ''))
 
     except asyncio.TimeoutError:
-        print('[dokmai] timeout')
+        print('[planaria] timeout')
         return None
     except Exception as e:
-        print(f'[dokmai] error: {e}')
+        print(f'[planaria] error: {e}')
         return None
 
 # ─────────────────────────────────────────────
@@ -208,7 +179,6 @@ class BuyModal(ui.Modal, title='Buy Token'):
         user_data = get_user(users, interaction.user)
         total     = round(qty * PRICE_PER_TOKEN, 2)
 
-        # Out of stock
         if len(inv['items']) < qty:
             await interaction.response.send_message(
                 embed=err_embed('The item is out of stock. Please inform the admin.'),
@@ -216,22 +186,18 @@ class BuyModal(ui.Modal, title='Buy Token'):
             )
             return
 
-        # Not enough money
         if user_data['balance'] < total:
             await interaction.response.send_message(
                 embed=err_embed('Not enough money'), ephemeral=True
             )
             return
 
-        # Take items (FIFO)
         taken        = inv['items'][:qty]
         inv['items'] = inv['items'][qty:]
         inv['sold'] += qty
 
-        # Deduct balance
         user_data['balance'] = round(user_data['balance'] - total, 2)
 
-        # Record purchase
         pid = f"P{len(purchases) + 1:04d}"
         ts  = datetime.now().isoformat()
         purchases[pid] = {
@@ -253,7 +219,6 @@ class BuyModal(ui.Modal, title='Buy Token'):
         save_users(users)
         save_purchases(purchases)
 
-        # Try to DM the tokens
         file_content = '\n'.join(taken).encode('utf-8')
         filename     = f"Token {interaction.user.name} {qty}.txt"
 
@@ -265,7 +230,6 @@ class BuyModal(ui.Modal, title='Buy Token'):
                 embed=ok_embed('succeed\nThe item is in DM'), ephemeral=True
             )
         except discord.Forbidden:
-            # DM failed — roll everything back
             inv2            = load_inv()
             inv2['items']   = taken + inv2['items']
             inv2['sold']   -= qty
@@ -360,7 +324,7 @@ class SystemSelect(ui.Select):
             ),
         ]
         super().__init__(
-            custom_id='shop:system_select',   # fixed → survives restarts
+            custom_id='shop:system_select',
             placeholder='system',
             min_values=1,
             max_values=1,
@@ -370,11 +334,9 @@ class SystemSelect(ui.Select):
     async def callback(self, interaction: discord.Interaction):
         value = self.values[0]
 
-        # ── buy Token ──────────────────────────────────
         if value == 'buy':
             await interaction.response.send_modal(BuyModal())
 
-        # ── check money ────────────────────────────────
         elif value == 'check_money':
             users     = load_users()
             user_data = get_user(users, interaction.user)
@@ -393,22 +355,18 @@ class SystemSelect(ui.Select):
                             inline=False)
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # ── Top up ─────────────────────────────────────
         elif value == 'topup':
             await interaction.response.send_modal(TopUpModal())
 
-        # ── history ────────────────────────────────────
         elif value == 'history':
             users     = load_users()
             user_data = get_user(users, interaction.user)
 
-            # Last 10 top-ups
             tops = user_data['top_ups'][-10:]
             tops_txt = '\n'.join(
                 f"• {t['amount']:.2f} ฿ — {t['timestamp'][:10]}" for t in tops
             ) or 'No top-up history.'
 
-            # Last 10 purchases
             purs = user_data['purchases'][-10:]
             purs_txt = '\n'.join(
                 f"• {p['purchase_id']} — {p['qty']} token(s) — {p['timestamp'][:10]}"
@@ -427,7 +385,6 @@ class SystemSelect(ui.Select):
             embed.add_field(name='Purchase History', value=purs_txt, inline=False)
             await interaction.response.send_message(embed=embed, ephemeral=True)
 
-        # ── wash ───────────────────────────────────────
         elif value == 'wash':
             await interaction.response.send_message(
                 embed=ok_embed('wash succeed'), ephemeral=True
@@ -436,7 +393,7 @@ class SystemSelect(ui.Select):
 
 class ShopView(ui.View):
     def __init__(self):
-        super().__init__(timeout=None)   # persistent
+        super().__init__(timeout=None)
         self.add_item(SystemSelect())
 
 # ─────────────────────────────────────────────
@@ -448,8 +405,6 @@ intents.message_content = True
 intents.members         = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
-
-# ─── owner check ──────────────────────────────
 
 def owner_only():
     async def predicate(ctx: commands.Context):
@@ -466,7 +421,6 @@ async def cmd_shop(ctx: commands.Context):
     """Post the shop embed with the system select menu."""
     inv = load_inv()
 
-    # No color → no left-border stripe (the "ไม่มีเส้น" look)
     embed = discord.Embed(
         description=(
             f'{E_SELL} **Sell Token**\n\n'
@@ -496,11 +450,7 @@ async def cmd_shop(ctx: commands.Context):
 async def cmd_add_token(ctx: commands.Context, *, raw: str):
     """
     !t <tokens>
-    Add one or more tokens to inventory.  One token per line.
-    e.g.:
-        !t mt
-        my
-        mn
+    Add one or more tokens. One token per line.
     """
     items = [line.strip() for line in raw.splitlines() if line.strip()]
     if not items:
@@ -526,8 +476,8 @@ async def cmd_add_token(ctx: commands.Context, *, raw: str):
 @owner_only()
 async def cmd_check(ctx: commands.Context, *, arg: str):
     """
-    !check <purchase_id>   →  send the tokens from that purchase as a file
-    !check all             →  send the full current inventory as a file
+    !check <purchase_id>  →  tokens from that purchase as file
+    !check all            →  full inventory as file
     """
     arg = arg.strip()
 
@@ -541,7 +491,6 @@ async def cmd_check(ctx: commands.Context, *, arg: str):
         await ctx.send(f'Total in stock: **{len(inv["items"])}**', file=file_obj)
         return
 
-    # Normalize  "1" → "P0001"
     pid = arg.upper()
     if not pid.startswith('P'):
         pid = 'P' + arg.zfill(4)
@@ -563,7 +512,7 @@ async def cmd_check(ctx: commands.Context, *, arg: str):
     )
 
 
-@bot.command(name='ckeck')       # intentional typo matching the spec
+@bot.command(name='ckeck')
 @owner_only()
 async def cmd_ckeck(ctx: commands.Context, *, arg: str):
     """Alias: !ckeck all"""
@@ -603,7 +552,6 @@ async def cmd_give_money(ctx: commands.Context, member: discord.Member, amount: 
 
 @bot.event
 async def on_ready():
-    # Register the persistent view so buttons/selects survive restarts
     bot.add_view(ShopView())
     print(f'[BOT] {bot.user} online | {len(bot.guilds)} guild(s)')
 
@@ -611,7 +559,7 @@ async def on_ready():
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
     if isinstance(error, commands.CheckFailure):
-        return   # unauthorized user — silent
+        return
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=err_embed(f'Missing argument: `{error.param.name}`'))
     elif isinstance(error, (commands.MemberNotFound, commands.BadArgument)):
@@ -627,15 +575,16 @@ async def on_command_error(ctx: commands.Context, error):
 if __name__ == '__main__':
     os.makedirs(DATA_DIR, exist_ok=True)
     bot.run(DISCORD_TOKEN)
-lects survive restarts
+───────
+
+@bot.event
+async def on_ready():
     bot.add_view(ShopView())
     print(f'[BOT] {bot.user} online | {len(bot.guilds)} guild(s)')
 
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    if isinstance(error, commands.CheckFailure):
-        return   # unauthorized user — silent
     if isinstance(error, commands.MissingRequiredArgument):
         await ctx.send(embed=err_embed(f'Missing argument: `{error.param.name}`'))
     elif isinstance(error, (commands.MemberNotFound, commands.BadArgument)):
@@ -644,4 +593,10 @@ async def on_command_error(ctx: commands.Context, error):
         print(f'[ERROR] {type(error).__name__}: {error}')
 
 
-# ───────────────────────
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+
+if __name__ == '__main__':
+    os.makedirs(DATA_DIR, exist_ok=True)
+    bot.run(DISCORD_TOKEN)
