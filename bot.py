@@ -575,7 +575,7 @@ async def on_command_error(ctx: commands.Context, error):
 if __name__ == '__main__':
     os.makedirs(DATA_DIR, exist_ok=True)
     bot.run(DISCORD_TOKEN)
-───────
+# ───────
 
 @bot.event
 async def on_ready():
