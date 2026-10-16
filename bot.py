@@ -15,11 +15,12 @@ load_dotenv()
 # CONFIG
 # ─────────────────────────────────────────────
 
-DISCORD_TOKEN  = os.getenv('DISCORD_TOKEN')
-OWNER_ID       = 1488103702488154173
+DISCORD_TOKEN   = os.getenv('DISCORD_TOKEN')
+OWNER_ID        = 1488103702488154173
 PRICE_PER_TOKEN = 0.65
-PHONE_NUMBER   = '0837751528'
-VALAN_URL      = 'https://angpao.dokmai.app/'
+PHONE_NUMBER    = '0837751528'
+DOKMAI_API_KEY  = '0da2d1ead86fa13403907f4796b0d93cbd96e51a7c87d1ffa74c4af9c396ac30'
+DOKMAI_URL      = 'https://angpao.dokmai.app/api/v1/redeem'
 GIF_URL        = (
     'https://cdn.discordapp.com/attachments/1559527131728584766/'
     '1560446530874515526/6414b459c71ca7c53b14798235d412e5.gif'
@@ -99,66 +100,78 @@ def err_embed(msg: str) -> discord.Embed:
 
 async def redeem_truemoney(voucher_link: str) -> float | None:
     """
-    Redeem a TrueMoney Wallet envelope via valan.shop.
-    POSTs the phone number + voucher link, parses the credited amount.
-
-    If valan.shop changes its API shape, adjust the payload keys or
-    response-parsing block below — everything else stays the same.
+    Redeem a TrueMoney Wallet envelope via angpao.dokmai.app
+    POST JSON → { phoneNumber, voucherCode }
+    Header: X-API-Key: <key>
+    Response success: { status: { code: "SUCCESS" }, data: { voucher: { amount_baht: N } } }
+    Returns amount (float) on success, None on failure.
     """
+    # ดึง voucher code ออกจาก URL ถ้าเป็น link เต็ม
+    # https://gift.truemoney.com/campaign/?v=XXXXXXXX → XXXXXXXX
+    import re
+    code = voucher_link.strip()
+    m = re.search(r'[?&]v=([A-Za-z0-9]+)', code)
+    if m:
+        code = m.group(1)
+
+    payload = {
+        'phoneNumber': PHONE_NUMBER,
+        'voucherCode': code,
+    }
+    headers = {
+        'Content-Type': 'application/json',
+        'X-API-Key':    DOKMAI_API_KEY,
+        'Accept':       'application/json',
+    }
+
     try:
         async with aiohttp.ClientSession() as session:
-            payload = {
-                'phone':   PHONE_NUMBER,
-                'voucher': voucher_link,   # adjust key name if valan.shop uses a different one
-                'link':    voucher_link,   # fallback key some sites use
-            }
-            headers = {
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0 Safari/537.36'
-                ),
-                'Accept': 'application/json, text/plain, */*',
-                'Referer': VALAN_URL,
-            }
             timeout = aiohttp.ClientTimeout(total=30)
             async with session.post(
-                VALAN_URL, data=payload, headers=headers, timeout=timeout
+                DOKMAI_URL,
+                json=payload,
+                headers=headers,
+                timeout=timeout,
             ) as resp:
-                if resp.status != 200:
-                    return None
+                raw = await resp.text()
+                print(f'[dokmai] status={resp.status} body={raw[:200]}')
 
-                # Try JSON first
                 try:
                     data = await resp.json(content_type=None)
-                    # Common field names across TrueMoney proxy sites
-                    for key in ('amount', 'value', 'money', 'credit', 'redeemAmount'):
-                        if key in data and isinstance(data[key], (int, float)):
-                            return float(data[key])
-
-                    # Nested under data / result
-                    for wrapper in ('data', 'result'):
-                        if isinstance(data.get(wrapper), dict):
-                            for key in ('amount', 'value', 'money'):
-                                val = data[wrapper].get(key)
-                                if isinstance(val, (int, float)):
-                                    return float(val)
-                    return None
                 except Exception:
-                    pass
+                    return None
 
-                # Fallback: look for a bare number in plain-text body
-                text = await resp.text()
-                import re
-                m = re.search(r'(?:amount|value|money)["\s:]+(\d+(?:\.\d+)?)', text, re.I)
-                if m:
-                    return float(m.group(1))
+                # ตรวจ success
+                status = data.get('status', {})
+                code_str = status.get('code', '')
+                if code_str != 'SUCCESS':
+                    print(f'[dokmai] failed: {code_str} — {status.get("message")}')
+                    return None
+
+                # ดึงจำนวนเงิน
+                voucher_data = data.get('data', {}).get('voucher', {})
+                for key in ('amount_baht', 'amount', 'value'):
+                    val = voucher_data.get(key)
+                    if isinstance(val, (int, float)):
+                        return float(val)
+
+                # fallback: หา amount ทุกที่ใน response
+                import json as _json
+                flat = _json.dumps(data)
+                nm = re.search(r'"amount_baht"\s*:\s*(\d+(?:\.\d+)?)', flat)
+                if nm:
+                    return float(nm.group(1))
+                nm = re.search(r'"amount"\s*:\s*(\d+(?:\.\d+)?)', flat)
+                if nm:
+                    return float(nm.group(1))
+
                 return None
 
     except asyncio.TimeoutError:
+        print('[dokmai] timeout')
         return None
     except Exception as e:
-        print(f'[valan.shop] error: {e}')
+        print(f'[dokmai] error: {e}')
         return None
 
 # ─────────────────────────────────────────────
@@ -614,3 +627,21 @@ async def on_command_error(ctx: commands.Context, error):
 if __name__ == '__main__':
     os.makedirs(DATA_DIR, exist_ok=True)
     bot.run(DISCORD_TOKEN)
+lects survive restarts
+    bot.add_view(ShopView())
+    print(f'[BOT] {bot.user} online | {len(bot.guilds)} guild(s)')
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error):
+    if isinstance(error, commands.CheckFailure):
+        return   # unauthorized user — silent
+    if isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(embed=err_embed(f'Missing argument: `{error.param.name}`'))
+    elif isinstance(error, (commands.MemberNotFound, commands.BadArgument)):
+        await ctx.send(embed=err_embed('Invalid argument.'))
+    else:
+        print(f'[ERROR] {type(error).__name__}: {error}')
+
+
+# ───────────────────────
