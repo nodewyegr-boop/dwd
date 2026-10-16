@@ -1,4 +1,0 @@
-# rename this file to  .env  and fll in your values
-
-# Your bot token from https://discord.com/developers/applications
-DISCORD_TOKEN=your_bot_token_here
