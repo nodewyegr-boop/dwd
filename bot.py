@@ -19,7 +19,7 @@ DISCORD_TOKEN  = os.getenv('DISCORD_TOKEN')
 OWNER_ID       = 1488103702488154173
 PRICE_PER_TOKEN = 0.65
 PHONE_NUMBER   = '0837751528'
-VALAN_URL      = 'https://valan.shop/'
+VALAN_URL      = 'https://angpao.dokmai.app/'
 GIF_URL        = (
     'https://cdn.discordapp.com/attachments/1559527131728584766/'
     '1560446530874515526/6414b459c71ca7c53b14798235d412e5.gif'
